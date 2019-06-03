@@ -138,7 +138,7 @@ class Estimator:
 				tf.summary.scalar('loss', self.loss),
 				tf.summary.scalar('avg_q_value', tf.reduce_mean(self.predictions)),
 				tf.summary.scalar('max_q_value', tf.reduce_max(self.predictions)),
-				tf.summary.histogram('loss_histogram', self.losses),
+				tf.summary.histogram('losses_histogram', self.losses),
 				tf.summary.histogram('q_values_histogram', self.predictions)
 			])
 
@@ -245,6 +245,105 @@ def make_epsilon_greedy_policy(estimator, n_actions):
 	return policy_fn
 
 
+class ReplayMemory:
+
+	def __init__(self, size, state_shape, save_directory):
+		self.size = size
+		self.state_shape = state_shape
+		self.save_directory = save_directory
+		self.Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'is_done'])
+		self.replay_memory = list()
+		self.n = 0
+		self.index = 0
+
+		# Define memmap shapes
+		state_shape = (size, *self.state_shape)
+		action_shape = (size, 1)
+		reward_shape = (size, 1)
+		next_state_shape = (size, *self.state_shape)
+		is_done_shape = (size, 1)
+
+		# print('state_memmap shape: {}'.format(state_shape))
+		# print('action_memmap shape: {}'.format(action_shape))
+		# print('reward_memmap shape: {}'.format(reward_shape))
+		# print('next_state_memmap shape: {}'.format(next_state_shape))
+		# print('is_done_memmap shape: {}'.format(is_done_shape))
+
+		# Define memmap paths
+		state_filepath = os.path.join(self.save_directory, 'state.rm')
+		action_filepath = os.path.join(self.save_directory, 'action.rm')
+		reward_filepath = os.path.join(self.save_directory, 'reward.rm')
+		next_state_filepath = os.path.join(self.save_directory, 'next_state.rm')
+		is_done_filepath = os.path.join(self.save_directory, 'is_done.rm')
+
+		# Create or open memmap
+		self.state_memmap = self._create_or_open_memmap(state_filepath, state_shape)
+		self.action_memmap = self._create_or_open_memmap(action_filepath, action_shape)
+		self.reward_memmap = self._create_or_open_memmap(reward_filepath, reward_shape)
+		self.next_state_memmap = self._create_or_open_memmap(next_state_filepath, next_state_shape)
+		self.is_done_memmap = self._create_or_open_memmap(is_done_filepath, is_done_shape)
+
+		# Fetch stored data, if any
+		metadata_filepath = os.path.join(self.save_directory, 'metadata.rm')
+		metadata_shape = (2,)
+		if os.path.isfile(metadata_filepath):
+			self.metadata_memmap = self._create_or_open_memmap(metadata_filepath, metadata_shape)
+			self.n = int(self.metadata_memmap[0])
+			self.index = int(self.metadata_memmap[1])
+			for i in range(self.n):
+				current_index = (i + self.index + 1) % self.n
+				state = np.asarray(self.state_memmap[current_index])
+				action = np.asarray(self.action_memmap[current_index])
+				reward = np.asarray(self.reward_memmap[current_index])
+				next_state = np.asarray(self.next_state_memmap[current_index])
+				is_done = np.asarray(self.is_done_memmap[current_index])
+				self._append(state, action, reward, next_state, is_done)
+		else:
+			self.metadata_memmap = self._create_or_open_memmap(metadata_filepath, metadata_shape)
+
+	def asarray(self):
+		return self.replay_memory
+
+	def _create_or_open_memmap(self, filepath, shape):
+		mode = 'w+'
+		if os.path.isfile(filepath):
+			mode = 'r+'
+		return np.memmap(
+			filepath,
+			dtype='float32',
+			mode=mode,
+			shape=shape
+		)
+
+	def _append(self, state, action, reward, next_state, is_done):
+		transition = self.Transition(state, action, reward, next_state, is_done)
+		self.replay_memory.append(transition)
+
+	def append(self, state, action, reward, next_state, is_done):
+		if self.n == self.size:
+			self.replay_memory.pop(0)
+
+		self._append(state, action, reward, next_state, is_done)
+
+		self.state_memmap[self.index] = state
+		self.action_memmap[self.index] = action
+		self.reward_memmap[self.index] = reward
+		self.next_state_memmap[self.index] = next_state
+		self.is_done_memmap[self.index] = is_done
+		self.state_memmap.flush()
+		self.action_memmap.flush()
+		self.reward_memmap.flush()
+		self.next_state_memmap.flush()
+		self.is_done_memmap.flush()
+
+		self.index = (self.index + 1) % self.size
+
+		if self.n < self.size:
+			self.n += 1
+			self.metadata_memmap[0] = self.n
+			self.metadata_memmap.flush()
+
+
 def deep_q_learning(
 		sess,
 		env,
@@ -254,7 +353,7 @@ def deep_q_learning(
 		n_episodes,
 		save_directory,
 		replay_memory_size=500000,
-		replay_memory_init_size=5000,
+		replay_memory_init_size=50000,
 		update_target_estimator_every=10000,
 		discount_factor=0.99,
 		epsilon_start=1.0,
@@ -289,10 +388,9 @@ def deep_q_learning(
 		An EpisodeStats object with two numpy arrays for episode_lengths and
 		episode_rewards.
 	"""
-	Transition = namedtuple("Transition", ["state", "action", "reward", "next_state", "done"])
 	EpisodeStats = namedtuple("Stats", ["episode_lengths", "episode_rewards"])
 
-	replay_memory = []
+	# replay_memory = list()
 
 	copier = NetworkCopier(
 		origin_model=q_estimator,
@@ -308,9 +406,12 @@ def deep_q_learning(
 	global_step = sess.run(tf.train.get_global_step())
 
 	# Define save directories
+	replay_memory_directory = os.path.join(save_directory, 'replay_memory')
 	checkpoint_directory = os.path.join(save_directory, 'checkpoints')
 	monitor_directory = os.path.join(save_directory, 'monitor')
 	summary_directory = os.path.join(save_directory, 'summary')
+	if not os.path.exists(replay_memory_directory):
+		os.makedirs(replay_memory_directory)
 	if not os.path.exists(checkpoint_directory):
 		os.makedirs(checkpoint_directory)
 	if not os.path.exists(monitor_directory):
@@ -324,6 +425,7 @@ def deep_q_learning(
 	if latest_checkpoint:
 		print('Loading model checkpoint: {}'.format(latest_checkpoint))
 		saver.restore(sess, latest_checkpoint)
+		print('Loaded model checkpoint')
 
 	# Epsilon decay schedule
 	epsilons = np.linspace(epsilon_start, epsilon_end, epsilon_decay_steps)
@@ -335,36 +437,44 @@ def deep_q_learning(
 	)
 
 	# Populate replay memory
-	state = env.reset()
-	state = image_processor.run(sess, state)
-	state = np.stack([state] * 4, axis=2)
-	for i in range(replay_memory_init_size):
-		if (i+1) % (replay_memory_init_size // 100) == 0:
-			print('Populating replay memory: {}%'.format(i * 100 // replay_memory_init_size))
-		epsilon = epsilons[min(global_step, epsilon_decay_steps - 1)]
-		action_probabilities = policy(
-			sess=sess,
-			state=state,
-			epsilon=epsilon
-		)
-		action = np.random.choice(
-			np.arange(len(action_probabilities)),
-			p=action_probabilities
-		)
-		next_state, reward, is_done, _ = env.step(action)
-		next_state = image_processor.run(sess, next_state)
-		next_state = np.append(state[:, :, 1:], np.expand_dims(next_state, 2), axis=2)
+	print('Loading replay memory: {}'.format(replay_memory_directory))
+	replay_memory = ReplayMemory(
+		size=replay_memory_size,
+		state_shape=(*PROCESSED_SHAPE, 4),
+		save_directory=replay_memory_directory
+	)
+	if replay_memory.n >= replay_memory_init_size:
+		print('Loaded replay memory')
+	else:
+		state = env.reset()
+		state = image_processor.run(sess, state)
+		state = np.stack([state] * 4, axis=2)
+		for i in range(replay_memory_init_size):
+			if (i+1) % (replay_memory_init_size // 100) == 0:
+				print('Populating replay memory: {}%'.format(i * 100 // replay_memory_init_size))
+			epsilon = epsilons[min(global_step, epsilon_decay_steps - 1)]
+			action_probabilities = policy(
+				sess=sess,
+				state=state,
+				epsilon=epsilon
+			)
+			action = np.random.choice(
+				np.arange(len(action_probabilities)),
+				p=action_probabilities
+			)
+			next_state, reward, is_done, _ = env.step(action)
+			next_state = image_processor.run(sess, next_state)
+			next_state = np.append(state[:, :, 1:], np.expand_dims(next_state, 2), axis=2)
 
-		# TODO: Append to replay memory
-		transition = Transition(state, action, reward, next_state, is_done)
-		replay_memory.append(transition)
+			# Append to replay memory
+			replay_memory.append(state, action, reward, next_state, is_done)
 
-		if is_done:
-			state = env.reset()
-			state = image_processor.run(sess, state)
-			state = np.stack([state] * 4, axis=2)
-		else:
-			state = next_state
+			if is_done:
+				state = env.reset()
+				state = image_processor.run(sess, state)
+				state = np.stack([state] * 4, axis=2)
+			else:
+				state = next_state
 
 	# Record video
 	env = wrappers.Monitor(
@@ -416,27 +526,33 @@ def deep_q_learning(
 			next_state = image_processor.run(sess, next_state)
 			next_state = np.append(state[:, :, 1:], np.expand_dims(next_state, 2), axis=2)
 
-			# TODO: Append to replay memory
-			transition = Transition(state, action, reward, next_state, is_done)
-			replay_memory.append(transition)
-
-			# Pop first replay if replay memory is full
-			if len(replay_memory) == replay_memory_size:
-				replay_memory.pop(0)
+			# Append to replay memory
+			replay_memory.append(state, action, reward, next_state, is_done)
 
 			# Update statistics
 			stats.episode_rewards[episode] += reward
 			stats.episode_lengths[episode] = step
 
 			# Sample a batch from replay memory
-			batch = random.sample(replay_memory, batch_size)
+			batch = random.sample(replay_memory.asarray(), batch_size)
 			state_batch, action_batch, reward_batch, next_state_batch, is_done_batch = map(np.array, zip(*batch))
+
+			# Squeeze into a single dimension
+			action_batch = np.squeeze(action_batch)
+			reward_batch = np.squeeze(reward_batch)
+			is_done_batch = np.squeeze(is_done_batch)
+
+			# print('state_batch shape: {}'.format(state_batch.shape))
+			# print('action_batch shape: {}'.format(action_batch.shape))
+			# print('reward_batch shape: {}'.format(reward_batch.shape))
+			# print('next_state_batch shape: {}'.format(next_state_batch.shape))
+			# print('is_done_batch shape: {}'.format(is_done_batch.shape))
 
 			# Get Q-values from frozen estimator
 			next_q_value_batch = target_estimator.run(sess, next_state_batch)
 
 			# Final step is just `reward_batch` so multiply the future reward by 0 if `is_done` is True
-			future_reward = np.invert(is_done_batch).astype(np.float32) * discount_factor * np.amax(next_q_value_batch, axis=1)
+			future_reward = np.invert(is_done_batch.astype(np.bool)).astype(np.float32) * discount_factor * np.amax(next_q_value_batch, axis=1)
 			target_batch = reward_batch + future_reward
 
 			# Run a train step
@@ -450,19 +566,19 @@ def deep_q_learning(
 			# Add summaries to TensorBoard
 			summary_writer.add_summary(summary, global_step)
 
-			print('{: <16}'.format('#: {}'.format(global_step)), end=' ')
-			print('{: <16}'.format('Step: {}'.format(step)), end=' ')
-			print('{: <16}'.format('Episode: {}'.format(episode + 1)), end=' ')
-			print('{: <16}'.format('Loss: {:.4f}'.format(loss)))
+			print('{: <18}'.format('#: {}'.format(global_step)), end=' ')
+			print('{: <18}'.format('Step: {}'.format(step)), end=' ')
+			print('{: <18}'.format('Episode: {}'.format(episode + 1)), end=' ')
+			print('{: <18}'.format('Loss: {:.4f}'.format(loss)))
 
 			state = next_state
 			step += 1
 
 		# Add summaries to TensorBoard
 		summary = tf.Summary()
-		summary.value.add(tag='episode/epsilon', simple_value=epsilon)
 		summary.value.add(tag='episode/rewards', simple_value=stats.episode_rewards[episode])
 		summary.value.add(tag='episode/steps', simple_value=stats.episode_lengths[episode])
+		summary.value.add(tag='episode/epsilon', simple_value=epsilon)
 		summary_writer.add_summary(summary, global_step)
 
 		# Write TensorBoard summary
@@ -576,7 +692,7 @@ def test_estimator(env):
 		print('-' * 80)
 
 
-def test(env):
+def run(env):
 	tf.reset_default_graph()
 
 	# Global step variable
@@ -586,7 +702,7 @@ def test(env):
 	target_estimator = Estimator(n_actions=env.action_space.n, scope='target_estimator')
 	image_processor = ImageProcessor(scope='image_processor')
 
-	save_directory = 'C:/Users/Jae/Desktop/dqn'
+	save_directory = 'C:\\Users\\Jae\\Desktop\\dqn'
 	# config = tf.ConfigProto(device_count={'GPU': 0})
 	# with tf.Session(config=config) as sess:
 	with tf.Session() as sess:
@@ -605,10 +721,7 @@ def test(env):
 
 def main():
 	env = gym.make('Breakout-v0')
-
-	# test_image_processor(env)
-	# test_estimator(env)
-	test(env)
+	run(env)
 
 
 if __name__ == '__main__':
