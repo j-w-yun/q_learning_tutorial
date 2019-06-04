@@ -9,6 +9,7 @@ from gym import wrappers
 from matplotlib import pyplot as plt
 
 
+USE_CPU = False
 INPUT_SHAPE = [210, 160, 3]
 CROP_TOP = 34
 CROP_BOTTOM = 16
@@ -263,12 +264,6 @@ class ReplayMemory:
 		next_state_shape = (size, *self.state_shape)
 		is_done_shape = (size, 1)
 
-		# print('state_memmap shape: {}'.format(state_shape))
-		# print('action_memmap shape: {}'.format(action_shape))
-		# print('reward_memmap shape: {}'.format(reward_shape))
-		# print('next_state_memmap shape: {}'.format(next_state_shape))
-		# print('is_done_memmap shape: {}'.format(is_done_shape))
-
 		# Define memmap paths
 		state_filepath = os.path.join(self.save_directory, 'state.rm')
 		action_filepath = os.path.join(self.save_directory, 'action.rm')
@@ -301,9 +296,6 @@ class ReplayMemory:
 		else:
 			self.metadata_memmap = self._create_or_open_memmap(metadata_filepath, metadata_shape)
 
-	def asarray(self):
-		return self.replay_memory
-
 	def _create_or_open_memmap(self, filepath, shape):
 		mode = 'w+'
 		if os.path.isfile(filepath):
@@ -315,9 +307,8 @@ class ReplayMemory:
 			shape=shape
 		)
 
-	def _append(self, state, action, reward, next_state, is_done):
-		transition = self.Transition(state, action, reward, next_state, is_done)
-		self.replay_memory.append(transition)
+	def asarray(self):
+		return self.replay_memory
 
 	def append(self, state, action, reward, next_state, is_done):
 		if self.n == self.size:
@@ -342,6 +333,10 @@ class ReplayMemory:
 			self.n += 1
 			self.metadata_memmap[0] = self.n
 			self.metadata_memmap.flush()
+
+	def _append(self, state, action, reward, next_state, is_done):
+		transition = self.Transition(state, action, reward, next_state, is_done)
+		self.replay_memory.append(transition)
 
 
 def deep_q_learning(
@@ -390,16 +385,14 @@ def deep_q_learning(
 	"""
 	EpisodeStats = namedtuple("Stats", ["episode_lengths", "episode_rewards"])
 
-	# replay_memory = list()
+	stats = EpisodeStats(
+		episode_lengths=np.zeros(n_episodes),
+		episode_rewards=np.zeros(n_episodes)
+	)
 
 	copier = NetworkCopier(
 		origin_model=q_estimator,
 		target_model=target_estimator
-	)
-
-	stats = EpisodeStats(
-		episode_lengths=np.zeros(n_episodes),
-		episode_rewards=np.zeros(n_episodes)
 	)
 
 	# Global step
@@ -443,15 +436,14 @@ def deep_q_learning(
 		state_shape=(*PROCESSED_SHAPE, 4),
 		save_directory=replay_memory_directory
 	)
-	if replay_memory.n >= replay_memory_init_size:
-		print('Loaded replay memory')
-	else:
+	print('Loaded replay memory')
+	if replay_memory.n < replay_memory_init_size:
 		state = env.reset()
 		state = image_processor.run(sess, state)
 		state = np.stack([state] * 4, axis=2)
-		for i in range(replay_memory_init_size):
-			if (i+1) % (replay_memory_init_size // 100) == 0:
-				print('Populating replay memory: {}%'.format(i * 100 // replay_memory_init_size))
+		for i in range(replay_memory_init_size - replay_memory.n):
+			if (i+replay_memory.n) % (replay_memory_init_size // 100) == 0:
+				print('Populating replay memory: {}%'.format((i+replay_memory.n) * 100 // replay_memory_init_size))
 			epsilon = epsilons[min(global_step, epsilon_decay_steps - 1)]
 			action_probabilities = policy(
 				sess=sess,
@@ -703,9 +695,10 @@ def run(env):
 	image_processor = ImageProcessor(scope='image_processor')
 
 	save_directory = 'C:\\Users\\Jae\\Desktop\\dqn'
-	# config = tf.ConfigProto(device_count={'GPU': 0})
-	# with tf.Session(config=config) as sess:
-	with tf.Session() as sess:
+	config = tf.ConfigProto()
+	if USE_CPU:
+		config = tf.ConfigProto(device_count={'GPU': 0})
+	with tf.Session(config=config) as sess:
 		sess.run(tf.global_variables_initializer())
 		for global_step, stats in deep_q_learning(
 				sess=sess,
