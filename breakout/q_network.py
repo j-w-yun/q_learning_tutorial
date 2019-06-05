@@ -1,5 +1,5 @@
 import os
-import random
+from abc import ABC, abstractmethod
 from collections import namedtuple
 
 import gym
@@ -246,14 +246,26 @@ def make_epsilon_greedy_policy(estimator, n_actions):
 	return policy_fn
 
 
-class ReplayMemory:
+class ReplayMemory(ABC):
 
 	def __init__(self, size, state_shape, save_directory):
 		self.size = size
 		self.state_shape = state_shape
 		self.save_directory = save_directory
-		self.Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'is_done'])
-		self.replay_memory = list()
+
+	@abstractmethod
+	def append(self, state, action, reward, next_state, is_done):
+		pass
+
+	@abstractmethod
+	def get_batch(self, size):
+		pass
+
+
+class MemmapReplayMemory(ReplayMemory):
+
+	def __init__(self, size, state_shape, save_directory):
+		super().__init__(size, state_shape, save_directory)
 		self.n = 0
 		self.index = 0
 
@@ -285,14 +297,6 @@ class ReplayMemory:
 			self.metadata_memmap = self._create_or_open_memmap(metadata_filepath, metadata_shape)
 			self.n = int(self.metadata_memmap[0])
 			self.index = int(self.metadata_memmap[1])
-			for i in range(self.n):
-				current_index = (i + self.index + 1) % self.n
-				state = np.asarray(self.state_memmap[current_index])
-				action = np.asarray(self.action_memmap[current_index])
-				reward = np.asarray(self.reward_memmap[current_index])
-				next_state = np.asarray(self.next_state_memmap[current_index])
-				is_done = np.asarray(self.is_done_memmap[current_index])
-				self._append(state, action, reward, next_state, is_done)
 		else:
 			self.metadata_memmap = self._create_or_open_memmap(metadata_filepath, metadata_shape)
 
@@ -307,36 +311,35 @@ class ReplayMemory:
 			shape=shape
 		)
 
-	def asarray(self):
-		return self.replay_memory
-
 	def append(self, state, action, reward, next_state, is_done):
-		if self.n == self.size:
-			self.replay_memory.pop(0)
-
-		self._append(state, action, reward, next_state, is_done)
-
 		self.state_memmap[self.index] = state
 		self.action_memmap[self.index] = action
 		self.reward_memmap[self.index] = reward
 		self.next_state_memmap[self.index] = next_state
 		self.is_done_memmap[self.index] = is_done
-		self.state_memmap.flush()
-		self.action_memmap.flush()
-		self.reward_memmap.flush()
-		self.next_state_memmap.flush()
-		self.is_done_memmap.flush()
+		# self.state_memmap.flush()
+		# self.action_memmap.flush()
+		# self.reward_memmap.flush()
+		# self.next_state_memmap.flush()
+		# self.is_done_memmap.flush()
 
 		self.index = (self.index + 1) % self.size
 
 		if self.n < self.size:
 			self.n += 1
 			self.metadata_memmap[0] = self.n
-			self.metadata_memmap.flush()
+			# self.metadata_memmap.flush()
 
-	def _append(self, state, action, reward, next_state, is_done):
-		transition = self.Transition(state, action, reward, next_state, is_done)
-		self.replay_memory.append(transition)
+	def get_batch(self, size):
+		indices = np.random.random_integers(0, self.n-1, size)
+
+		state_batch = np.take(self.state_memmap, indices, axis=0)
+		action_batch = np.take(self.action_memmap, indices, axis=0)
+		reward_batch = np.take(self.reward_memmap, indices, axis=0)
+		next_state_batch = np.take(self.next_state_memmap, indices, axis=0)
+		is_done_batch = np.take(self.is_done_memmap, indices, axis=0)
+
+		return state_batch, action_batch, reward_batch, next_state_batch, is_done_batch
 
 
 def deep_q_learning(
@@ -431,7 +434,7 @@ def deep_q_learning(
 
 	# Populate replay memory
 	print('Loading replay memory: {}'.format(replay_memory_directory))
-	replay_memory = ReplayMemory(
+	replay_memory = MemmapReplayMemory(
 		size=replay_memory_size,
 		state_shape=(*PROCESSED_SHAPE, 4),
 		save_directory=replay_memory_directory
@@ -526,8 +529,7 @@ def deep_q_learning(
 			stats.episode_lengths[episode] = step
 
 			# Sample a batch from replay memory
-			batch = random.sample(replay_memory.asarray(), batch_size)
-			state_batch, action_batch, reward_batch, next_state_batch, is_done_batch = map(np.array, zip(*batch))
+			state_batch, action_batch, reward_batch, next_state_batch, is_done_batch = replay_memory.get_batch(batch_size)
 
 			# Squeeze into a single dimension
 			action_batch = np.squeeze(action_batch)
